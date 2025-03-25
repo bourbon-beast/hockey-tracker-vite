@@ -45,7 +45,7 @@ def setup_competitions_and_grades(teams_data):
     for team in teams_data:
         comp_id = team["comp_id"]
         fixture_id = team["fixture_id"]
-        team_type = team["type"]  # Now properly set by builder.py
+        team_type = team["type"]  # Now properly set by season_builder.py
 
         # Process competition if new
         if comp_id not in competitions:
