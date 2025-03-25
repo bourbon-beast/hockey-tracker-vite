@@ -12,15 +12,6 @@ import {
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 
-// Existing methods...
-
-// ===== CLUB METHODS =====
-
-// src/services/firestoreService.js
-// Add these functions to your existing firestoreService.js file
-
-
-
 /**
  * Fetch games for a specific date range
  * @param {Date} startDate - Start date for range
