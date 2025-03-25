@@ -1,291 +1,119 @@
-import requests
-from bs4 import BeautifulSoup
-import re
-import json
-import logging
-import time
-from urllib.parse import urljoin
-from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials, firestore
+def create_competition(comp):
+    """Create a competition in Firestore."""
+    comp_id = comp["comp_id"]
+    fixture_id = comp["fixture_id"]
+    comp_name = comp.get("comp_heading", comp["name"])
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"builder_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+    # Determine competition type
+    comp_type = "Senior"  # Default type
+    if "junior" in comp_name.lower() or any(f"u{i}" in comp_name.lower() for i in range(10, 19)):
+        comp_type = "Junior"
+    elif "masters" in comp_name.lower() or any(f"{i}+" in comp_name.lower() for i in [35, 45, 60]):
+        comp_type = "Midweek/Masters"
 
-# Constants
-BASE_URL = "https://www.revolutionise.com.au/vichockey/games/"
-TEAM_FILTER = "Mentone"
-OUTPUT_FILE = "mentone_teams.json"
-REQUEST_TIMEOUT = 10  # seconds
-MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds
+    # Extract season info
+    season = str(datetime.now().year)  # Default to current year
+    if " - " in comp_name:
+        parts = comp_name.split(" - ")
+        if len(parts) > 1 and parts[1].strip().isdigit():
+            season = parts[1].strip()
 
-# This will store the discovered teams
-mentone_teams = []
+    # Create the Firestore document
+    document_id = make_comp_id(comp_id)
+    comp_ref = db.collection("competitions").document(document_id)
 
-# Regex for fixture links: /games/{comp_id}/{fixture_id}
-COMP_FIXTURE_REGEX = re.compile(r"/games/(\d+)/(\d+)")
+    comp_data = {
+        "id": document_id,
+        "original_id": comp_id,
+        "name": comp_name,
+        "type": comp_type,
+        "season": season,
+        "fixture_id": fixture_id,
+        "start_date": firestore.SERVER_TIMESTAMP,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "active": True
+    }
 
-# Gender/type classification based on naming
-GENDER_MAP = {
-    "men": "Men",
-    "women": "Women",
-    "boys": "Boys",
-    "girls": "Girls",
-    "mixed": "Mixed"
-}
-
-TYPE_KEYWORDS = {
-    "senior": "Senior",
-    "junior": "Junior",
-    "midweek": "Midweek",
-    "masters": "Masters",
-    "outdoor": "Outdoor",
-    "indoor": "Indoor"
-}
-
-# Initialize Firebase (if needed)
-def init_firebase():
-    """Initialize Firebase if not already initialized."""
-    if not firebase_admin._apps:
-        try:
-            cred = credentials.Certificate("../secrets/serviceAccountKey.json")
-            firebase_admin.initialize_app(cred)
-            logger.info("Firebase initialized successfully")
-        except Exception as e:
-            logger.warning(f"Firebase initialization skipped: {e}")
-            return None
-
-    return firestore.client()
-
-def extract_club_info(team_name):
-    """
-    Extract club name from team name and create a club ID.
-
-    Args:
-        team_name (str): Team name (e.g. "Mentone - Men's Vic League 1")
-
-    Returns:
-        tuple: (club_name, club_id)
-    """
-    if " - " in team_name:
-        club_name = team_name.split(" - ")[0].strip()
+    if not is_dry_run():
+        comp_ref.set(comp_data)
+        logger.info(f"Created competition: {comp_name} ({document_id})")
     else:
-        # Handle case where there's no delimiter
-        club_name = team_name.split()[0]
+        logger.info(f"DRY RUN: Would create competition: {comp_name} ({document_id})")
 
-    # Generate club_id - lowercase, underscores
-    club_id = f"club_{club_name.lower().replace(' ', '_').replace('-', '_')}"
+    return comp_ref, comp_data
 
-    return club_name, club_id
+def create_grade(comp, competition_ref, competition_data):
+    """Create a grade (fixture) in Firestore."""
+    fixture_id = comp["fixture_id"]
+    comp_id = comp["comp_id"]
+    comp_name = comp["name"]
 
-def create_or_get_club(db, club_name, club_id):
-    """
-    Create a club in Firestore if it doesn't exist.
+    # Determine type and gender
+    team_type, team_gender = classify_team(comp_name)
 
-    Args:
-        db (firestore.Client): Firestore client
-        club_name (str): Club name
-        club_id (str): Generated club ID
+    # Generate grade ID
+    document_id = make_grade_id(fixture_id)
 
-    Returns:
-        DocumentReference: Reference to the club document
-    """
-    if not db:
-        logger.warning(f"Firebase not initialized, skipping club creation for {club_name}")
-        return None
+    # Create grade data
+    grade_data = {
+        "id": document_id,
+        "original_id": fixture_id,
+        "name": comp_name,
+        "comp_id": comp_id,
+        "competition_name": competition_data.get("name", ""),
+        "competition_id": competition_data.get("id", ""),
+        "competition_ref": competition_ref,
+        "type": team_type,
+        "gender": team_gender,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP
+    }
 
-    club_ref = db.collection("clubs").document(club_id)
+    # Save to Firestore
+    grade_ref = db.collection("grades").document(document_id)
 
-    # Check if club exists
-    if not club_ref.get().exists:
-        logger.info(f"Creating new club: {club_name} ({club_id})")
-
-        # Default to Mentone fields for Mentone, generic for others
-        is_mentone = club_name.lower() == "mentone"
-        club_data = {
-            "id": club_id,
-            "name": f"{club_name} Hockey Club" if is_mentone else club_name,
-            "short_name": club_name,
-            "code": "".join([word[0] for word in club_name.split()]).upper(),
-            "location": "Melbourne, Victoria" if is_mentone else None,
-            "home_venue": "Mentone Grammar Playing Fields" if is_mentone else None,
-            "primary_color": "#0066cc" if is_mentone else "#333333",
-            "secondary_color": "#ffffff",
-            "active": True,
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "is_home_club": is_mentone
-        }
-
-        club_ref.set(club_data)
-
-    return club_ref
-
-def classify_team(comp_name):
-    """
-    Classify a team by type and gender based on competition name.
-
-    Args:
-        comp_name (str): Competition name
-
-    Returns:
-        tuple: (team_type, gender)
-    """
-    comp_name_lower = comp_name.lower()
-
-    # Determine team type
-    team_type = "Unknown"
-    for keyword, value in TYPE_KEYWORDS.items():
-        if keyword in comp_name_lower:
-            team_type = value
-            break
-
-    # Special case handling - identify senior/junior/masters competitions
-    if "premier league" in comp_name_lower or "vic league" in comp_name_lower or "pennant" in comp_name_lower:
-        team_type = "Senior"
-    elif "u12" in comp_name_lower or "u14" in comp_name_lower or "u16" in comp_name_lower or "u18" in comp_name_lower:
-        team_type = "Junior"
-    elif "masters" in comp_name_lower or "35+" in comp_name_lower or "45+" in comp_name_lower or "60+" in comp_name_lower:
-        team_type = "Midweek"
-
-    # Determine gender from competition name
-    if "women's" in comp_name_lower:
-        gender = "Women"
-    elif "men's" in comp_name_lower:
-        gender = "Men"
+    if not is_dry_run():
+        grade_ref.set(grade_data)
+        logger.info(f"Created grade: {comp_name} ({document_id})")
     else:
-        # Fall back to keyword checking if not explicitly men's/women's
-        gender = "Unknown"
-        for keyword, value in GENDER_MAP.items():
-            if keyword in comp_name_lower:
-                gender = value
-                break
+        logger.info(f"DRY RUN: Would create grade: {comp_name} ({document_id})")
 
-    return team_type, gender
+    return grade_ref, grade_data
 
-def is_valid_team(name):
-    """
-    Filter out false positives like venue names.
-
-    Args:
-        name (str): Team name
-
-    Returns:
-        bool: True if valid team, False otherwise
-    """
-    invalid_keywords = ["playing fields", "grammar"]
-    return all(kw not in name.lower() for kw in invalid_keywords) and "hockey club" in name.lower()
-
-def create_team_name(comp_name, club="Mentone"):
-    """
-    Create a team name from competition name.
-
-    Args:
-        comp_name (str): Competition name
-        club (str): Club name prefix
-
-    Returns:
-        str: Formatted team name
-    """
-    # Strip year and clean up
-    name = comp_name.split(' - ')[0] if ' - ' in comp_name else comp_name
-    return f"{club} - {name}"
-
-def make_request(url, retry_count=0):
-    """
-    Make an HTTP request with retries and error handling.
-
-    Args:
-        url (str): URL to request
-        retry_count (int): Current retry attempt
-
-    Returns:
-        requests.Response or None: Response object if successful, None if failed
-    """
-    try:
-        logger.debug(f"Requesting: {url}")
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.RequestException as e:
-        if retry_count < MAX_RETRIES:
-            logger.warning(f"Request to {url} failed: {e}. Retrying ({retry_count+1}/{MAX_RETRIES})...")
-            time.sleep(RETRY_DELAY)
-            return make_request(url, retry_count + 1)
-        else:
-            logger.error(f"Request to {url} failed after {MAX_RETRIES} attempts: {e}")
-            return None
-
-def get_competition_blocks():
-    """
-    Scrape the main page to get all competition blocks.
-
-    Returns:
-        list: List of competition dictionaries
-    """
-    logger.info("Discovering competitions from main page...")
-    res = make_request(BASE_URL)
-    if not res:
-        logger.error(f"Failed to get main page: {BASE_URL}")
-        return []
-
-    soup = BeautifulSoup(res.text, "html.parser")
-    competitions = []
-    current_heading = ""
-
-    # Find competition headings and links
-    headings = soup.find_all("h2")
-    logger.info(f"Found {len(headings)} competition heading sections")
-
-    for div in soup.select("div.px-4.py-2.border-top"):
-        heading_el = div.find_previous("h2")
-        if heading_el:
-            current_heading = heading_el.text.strip()
-
-        a = div.find("a")
-        if a and a.get("href"):
-            match = COMP_FIXTURE_REGEX.search(a["href"])
-            if match:
-                comp_id, fixture_id = match.groups()
-                comp_name = a.text.strip()
-                competitions.append({
-                    "name": comp_name,
-                    "comp_heading": current_heading,
-                    "comp_id": comp_id,
-                    "fixture_id": fixture_id,
-                    "url": urljoin("https://www.hockeyvictoria.org.au", a["href"])
-                })
-                logger.debug(f"Added competition: {comp_name} ({comp_id}/{fixture_id})")
-
-    logger.info(f"Found {len(competitions)} competitions")
-    return competitions
-
-def find_mentone_teams(competitions, db=None):
-    """
-    Scan round 1 of each competition to find Mentone teams.
-
-    Args:
-        competitions (list): List of competition dictionaries
-        db (firestore.Client): Firestore client for club creation
-    """
-    logger.info(f"Scanning {len(competitions)} competitions for Mentone teams...")
+def find_and_create_teams(competitions):
+    """Scan competitions to find teams and create in Firestore."""
+    logger.info(f"Scanning {len(competitions)} competitions for teams...")
+    teams = []
     seen = set()
     processed_count = 0
-    club_name = "Mentone"  # Club variable for consistent naming
 
+    # Create all competitions and grades first
+    comp_refs = {}
+    comp_data_map = {}
+    grade_refs = {}
+    grade_data_map = {}
+
+    for comp in competitions:
+        # Create competition
+        comp_ref, comp_data = create_competition(comp)
+        comp_id = comp["comp_id"]
+        comp_refs[comp_id] = comp_ref
+        comp_data_map[comp_id] = comp_data
+
+        # Create grade
+        grade_ref, grade_data = create_grade(comp, comp_ref, comp_data)
+        fixture_id = comp["fixture_id"]
+        grade_refs[fixture_id] = grade_ref
+        grade_data_map[fixture_id] = grade_data
+
+    # Process teams
     for comp in competitions:
         processed_count += 1
         comp_name = comp['name']
-        round_url = f"https://www.hockeyvictoria.org.au/games/{comp['comp_id']}/{comp['fixture_id']}/round/1"
+        comp_id = comp['comp_id']
+        fixture_id = comp['fixture_id']
+        round_url = f"https://www.hockeyvictoria.org.au/games/{comp_id}/{fixture_id}/round/1"
 
         logger.info(f"[{processed_count}/{len(competitions)}] Checking {comp_name} at {round_url}")
 
@@ -294,136 +122,200 @@ def find_mentone_teams(competitions, db=None):
             continue
 
         soup = BeautifulSoup(response.text, "html.parser")
-        found_in_comp = False
 
+        # Extract teams from the page
+        team_info = {}
         for a in soup.find_all("a"):
+            href = a.get("href", "")
             text = a.text.strip()
-            if TEAM_FILTER.lower() in text.lower() and is_valid_team(text):
-                team_type, gender = classify_team(comp_name)
-                team_name = create_team_name(comp_name)
 
-                # Extract club information
-                club_name, club_id = extract_club_info(team_name)
-                club_ref = None
+            # Check if this is a team link
+            team_match = TEAM_ID_REGEX.search(href)
+            if team_match and is_valid_team(text):
+                link_comp_id, team_id = team_match.groups()
+                if link_comp_id == comp_id:
+                    team_info[text] = team_id
 
-                # Create or get club in Firestore if DB is available
-                if db:
-                    club_ref = create_or_get_club(db, club_name, club_id)
+        # Also look for teams in fixture details
+        fixture_teams = set()
+        for div in soup.select(".fixture-details-team-name"):
+            text = div.text.strip()
+            if text:
+                fixture_teams.add(text)
 
-                key = (team_name, comp['fixture_id'])
+        # Combine both sources
+        all_teams = set(team_info.keys()) | fixture_teams
 
-                if key in seen:
-                    continue
+        # Get the competition type and gender
+        comp_data = comp_data_map.get(comp_id, {})
+        grade_data = grade_data_map.get(fixture_id, {})
+        team_type = grade_data.get("type", comp_data.get("type", "Unknown"))
+        team_gender = grade_data.get("gender", "Unknown")
 
-                seen.add(key)
+        # Create/update teams
+        for team_name in all_teams:
+            # Extract club information
+            club_name, club_id = extract_club_info(team_name)
 
-                # Create team object
-                team_data = {
-                    "name": team_name,
-                    "fixture_id": int(comp['fixture_id']),
-                    "comp_id": int(comp['comp_id']),
-                    "comp_name": comp['name'],
-                    "type": team_type,
-                    "gender": gender,
-                    "club": club_name,
-                    "club_id": club_id,
-                    "is_home_club": club_name.lower() == "mentone"
-                }
+            # Check if it's the home club
+            is_home_club = club_id.lower() == HOME_CLUB_ID.lower()
 
-                # Add club reference if available
-                if club_ref:
-                    team_data["club_ref"] = club_ref
+            # Create a proper team name using the competition name
+            competition_part = comp_name.split(' - ')[0] if ' - ' in comp_name else comp_name
+            proper_team_name = f"{club_name} - {competition_part}"
 
-                mentone_teams.append(team_data)
-                found_in_comp = True
-                logger.info(f"Found team: {team_name} ({team_type}, {gender}, club: {club_name})")
+            # Skip if we've already seen this team
+            key = (proper_team_name, fixture_id)
+            if key in seen:
+                continue
 
-        if not found_in_comp:
-            logger.debug(f"No Mentone teams found in {comp_name}")
+            seen.add(key)
 
-    logger.info(f"Team discovery complete. Found {len(mentone_teams)} teams.")
+            # Get team ID from extracted info or generate one
+            team_id = team_info.get(team_name, f"{team_type.lower()}_{fixture_id}")
+            document_id = make_team_id(team_id)
 
-def save_teams_to_json(output_file=OUTPUT_FILE):
-    """
-    Save discovered teams to a JSON file.
+            # Create or get club reference and data
+            club_ref, club_data = create_or_get_club(club_name, club_id)
 
-    Args:
-        output_file (str): Output file path
-    """
+            # Create team data
+            team_data = {
+                "id": document_id,
+                "original_id": team_id,
+                "name": proper_team_name,
+                "fixture_id": fixture_id,
+                "comp_id": comp_id,
+                "type": team_type,
+                "gender": team_gender,
+                "club": club_name,
+                "club_id": club_id,
+                "club_ref": club_ref,
+                "is_home_club_team": is_home_club,
+                "comp_name": comp_name,
+                "competition_name": comp_data.get("name", ""),
+                "competition_id": comp_data.get("id", ""),
+                "competition_ref": comp_refs.get(comp_id),
+                "grade_name": grade_data.get("name", ""),
+                "grade_id": grade_data.get("id", ""),
+                "grade_ref": grade_refs.get(fixture_id),
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "active": True
+            }
+
+            # Add to teams list
+            teams.append(team_data)
+
+            # Save to Firestore
+            if not is_dry_run():
+                db.collection("teams").document(document_id).set(team_data)
+
+            # Log team discovery
+            if is_home_club:
+                logger.info(f"Found Mentone team: {proper_team_name} (ID: {document_id}, Type: {team_type}, Gender: {team_gender})")
+            else:
+                logger.debug(f"Found team: {proper_team_name} (ID: {document_id})")
+
+    logger.info(f"Team discovery complete. Found {len(teams)} teams total.")
+    return teams
+
+def archive_old_teams():
+    """Mark old teams as inactive."""
+    current_year = datetime.now().year
+
+    logger.info(f"Archiving teams from seasons before {current_year}")
+
+    # Get all teams that don't have the current year as season
+    if is_dry_run():
+        logger.info("DRY RUN: Would archive old teams")
+        return 0
+
+    teams_ref = db.collection("teams")
+    teams_query = teams_ref.where("season", "<", current_year).stream()
+
+    count = 0
+    for team in teams_query:
+        team.reference.update({
+            "active": False,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+        count += 1
+
+    logger.info(f"Archived {count} teams from previous seasons")
+    return count
+
+def save_teams_to_json(teams, output_file=OUTPUT_FILE):
+    """Save discovered teams to a JSON file."""
     try:
-        # Remove club_ref references as they're not JSON serializable
+        # Remove references as they're not JSON serializable
         cleaned_teams = []
-        for team in mentone_teams:
+        for team in teams:
             team_copy = team.copy()
-            if 'club_ref' in team_copy:
-                del team_copy['club_ref']
+            ref_fields = ['club_ref', 'competition_ref', 'grade_ref']
+            for field in ref_fields:
+                if field in team_copy:
+                    del team_copy[field]
             cleaned_teams.append(team_copy)
 
         with open(output_file, "w") as f:
             json.dump(cleaned_teams, f, indent=2)
-        logger.info(f"Successfully saved {len(mentone_teams)} teams to {output_file}")
+        logger.info(f"Successfully saved {len(teams)} teams to {output_file}")
     except Exception as e:
         logger.error(f"Failed to save teams to {output_file}: {e}")
 
-def save_teams_to_firestore(db):
-    """
-    Save discovered teams to Firestore.
+def create_settings():
+    """Create default settings in Firestore."""
+    logger.info("Creating settings...")
 
-    Args:
-        db (firestore.Client): Firestore client
-    """
-    if not db:
-        logger.warning("Firebase not initialized, skipping Firestore save")
-        return
+    settings_data = {
+        "id": "email_settings",
+        "version": 1,
+        "pre_game_hours": 24,
+        "weekly_summary_day": "Sunday",
+        "weekly_summary_time": "20:00",
+        "admin_emails": ["admin@mentone.com"],
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP
+    }
 
-    try:
-        teams_collection = db.collection("teams")
-        saved_count = 0
+    if not is_dry_run():
+        db.collection("settings").document("email_settings").set(settings_data)
 
-        for team in mentone_teams:
-            team_id = f"team_{team['fixture_id']}"
-            team_data = team.copy()
-
-            # Add timestamps
-            team_data["created_at"] = firestore.SERVER_TIMESTAMP
-            team_data["updated_at"] = firestore.SERVER_TIMESTAMP
-
-            # Save to Firestore
-            teams_collection.document(team_id).set(team_data)
-            saved_count += 1
-
-        logger.info(f"Successfully saved {saved_count} teams to Firestore")
-    except Exception as e:
-        logger.error(f"Failed to save teams to Firestore: {e}")
+    logger.info("Created email settings")
 
 def main():
     """Main function to run the builder script."""
     start_time = time.time()
-    logger.info(f"=== Mentone Hockey Club Team Builder ===")
-    logger.info(f"Starting team discovery process. Looking for teams containing '{TEAM_FILTER}'")
+    logger.info(f"=== Mentone Hockey Club Season Builder ===")
+
+    # Check if we're in dry run mode
+    if is_dry_run():
+        logger.info("Running in DRY RUN mode - no Firestore changes will be made")
 
     try:
-        # Initialize Firebase (optional)
-        db = init_firebase()
+        # Archive old teams
+        archive_old_teams()
 
-        # Run the team discovery process
+        # Get competitions
         comps = get_competition_blocks()
-        if comps:
-            find_mentone_teams(comps, db)
-            save_teams_to_json()
-
-            # Save to Firestore if available
-            if db:
-                save_teams_to_firestore(db)
-        else:
+        if not comps:
             logger.error("No competitions found. Exiting.")
+            return
+
+        # Find and create teams
+        teams = find_and_create_teams(comps)
+
+        # Save teams to JSON for backup
+        save_teams_to_json(teams)
+
+        # Create settings
+        create_settings()
+
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
 
     elapsed_time = time.time() - start_time
     logger.info(f"Script completed in {elapsed_time:.2f} seconds")
-    logger.info(f"Total competitions scanned: {len(comps) if 'comps' in locals() else 0}")
-    logger.info(f"Total teams discovered: {len(mentone_teams)}")
 
 if __name__ == "__main__":
     main()

@@ -1,268 +1,130 @@
-import firebase_admin
-from firebase_admin import credentials, firestore
-import requests
-from bs4 import BeautifulSoup
-import json
-import logging
-import time
-import re
-from datetime import datetime, timedelta
-import os
+def poll_recent_results():
+    """Poll for game results from the past week plus upcoming 2 weeks."""
+    # Define date range (past week + upcoming 2 weeks)
+    today = datetime.now()
+    start_date = today - timedelta(days=7)
+    end_date = today + timedelta(days=14)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"poller_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+    logger.info(f"Polling for results between {start_date.date()} and {end_date.date()}")
 
-# Constants
-BASE_URL = "https://www.revolutionise.com.au/vichockey/games/"
-TEAM_FILTER = "Mentone"
-TEAMS_FILE = "mentone_teams.json"
-REQUEST_TIMEOUT = 10  # seconds
-MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds
+    # Get all Mentone teams
+    mentone_teams = get_mentone_teams()
 
-# Initialize Firebase
-if not firebase_admin._apps:
-    try:
-        cred = credentials.Certificate("path/to/serviceAccountKey.json")
-        firebase_admin.initialize_app(cred)
-    except Exception as e:
-        logger.error(f"Failed to initialize Firebase: {e}")
-        raise
+    if not mentone_teams:
+        logger.warning("No Mentone teams found, exiting")
+        return
 
-db = firestore.client()
+    # Process each team separately
+    all_updated_games = []
+    total_games_created = 0
+    total_games_updated = 0
 
-def make_request(url, retry_count=0):
-    """
-    Make an HTTP request with retries and error handling.
+    for team_name, team_data in mentone_teams.items():
+        # Process results for this team
+        updated_games, games_created, games_updated = process_team_results(
+            team_data, start_date, end_date
+        )
 
-    Args:
-        url (str): URL to request
-        retry_count (int): Current retry attempt
+        # Add to totals
+        if updated_games:
+            all_updated_games.extend(updated_games)
+            total_games_created += games_created
+            total_games_updated += games_updated
 
-    Returns:
-        requests.Response or None: Response object if successful, None if failed
-    """
-    try:
-        logger.debug(f"Requesting: {url}")
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.RequestException as e:
-        if retry_count < MAX_RETRIES:
-            logger.warning(f"Request to {url} failed: {e}. Retrying ({retry_count+1}/{MAX_RETRIES})...")
-            time.sleep(RETRY_DELAY)
-            return make_request(url, retry_count + 1)
-        else:
-            logger.error(f"Request to {url} failed after {MAX_RETRIES} attempts: {e}")
-            return None
+    # Update games in Firestore
+    if all_updated_games:
+        update_games_in_firestore(all_updated_games)
 
-def load_mentone_teams():
-    """
-    Load the Mentone teams from the JSON file.
+        # Update summaries
+        update_summaries(mentone_teams, all_updated_games)
 
-    Returns:
-        list: List of team dictionaries
-    """
-    try:
-        with open(os.path.join("backend", TEAMS_FILE), "r") as f:
-            teams = json.load(f)
-        logger.info(f"Loaded {len(teams)} teams from {TEAMS_FILE}")
-        return teams
-    except Exception as e:
-        logger.error(f"Failed to load teams from {TEAMS_FILE}: {e}")
-        return []
+    logger.info(f"Results polling completed: {len(all_updated_games)} games processed, "
+                f"{total_games_created} created, {total_games_updated} updated")
 
-def extract_game_details(game_element):
-    """
-    Extract game details from a game element in the HTML.
+def update_games_in_firestore(games):
+    """Update games in Firestore using batch operations."""
+    if not games:
+        logger.info("No games to update")
+        return 0, 0
 
-    Args:
-        game_element (BeautifulSoup): Game element from the HTML
+    logger.info(f"Updating {len(games)} games in Firestore")
 
-    Returns:
-        dict: Game details
-    """
-    game_details = {}
+    # Transform function to prepare games for Firestore
+    def transform_game(game):
+        # Ensure timestamps
+        game["updated_at"] = firestore.SERVER_TIMESTAMP
+        game["last_polled_at"] = firestore.SERVER_TIMESTAMP
 
-    # Get date and time
-    date_element = game_element.select_one(".fixture-details-date-long")
-    if date_element:
-        # Example: "Monday, 14 April 2025 - 7:30 PM"
-        date_text = date_element.text.strip()
-        try:
-            date_parts = date_text.split(" - ")
-            date_str = date_parts[0]  # "Monday, 14 April 2025"
-            time_str = date_parts[1] if len(date_parts) > 1 else "12:00 PM"  # "7:30 PM"
+        if "created_at" not in game:
+            game["created_at"] = firestore.SERVER_TIMESTAMP
 
-            # Parse date and time
-            datetime_str = f"{date_str} {time_str}"
-            game_date = datetime.strptime(datetime_str, "%A, %d %B %Y %I:%M %p")
-            game_details["date"] = game_date
-        except Exception as e:
-            logger.warning(f"Failed to parse date: {date_text}, error: {e}")
-            game_details["date"] = None
+        # Remove any reference objects that might have been added
+        ref_fields = ["team_ref", "club_ref", "competition_ref", "grade_ref"]
+        for field in ref_fields:
+            if field in game:
+                del game[field]
 
-    # Get venue
-    venue_element = game_element.select_one(".fixture-details-venue")
-    if venue_element:
-        game_details["venue"] = venue_element.text.strip()
+        return game
 
-    # Get round
-    round_element = game_element.select_one(".fixture-details-round")
-    if round_element:
-        round_text = round_element.text.strip()
-        round_match = re.search(r"Round (\d+)", round_text)
-        if round_match:
-            game_details["round"] = int(round_match.group(1))
+    # Use batch writing
+    creates, updates = batch_write_to_firestore(db, games, "games", transform_game)
 
-    # Get teams and scores
-    teams_element = game_element.select_one(".fixture-details-teams")
-    if teams_element:
-        # Home team
-        home_element = teams_element.select_one(".fixture-details-team-home")
-        if home_element:
-            home_name_element = home_element.select_one(".fixture-details-team-name")
-            if home_name_element:
-                game_details["home_team"] = {
-                    "name": home_name_element.text.strip()
-                }
+    logger.info(f"Created {creates} new games, updated {updates} existing games")
+    return creates, updates
 
-            home_score_element = home_element.select_one(".fixture-details-team-score")
-            if home_score_element:
-                score_text = home_score_element.text.strip()
-                if score_text and score_text != "-":
-                    try:
-                        game_details["home_team"]["score"] = int(score_text)
-                    except ValueError:
-                        logger.warning(f"Invalid home score: {score_text}")
+def update_summaries(mentone_teams, all_games):
+    """Update team and club summaries based on games."""
+    # Group games by team
+    team_games = {}
+    for game in all_games:
+        # Process home team
+        home_team_id = game["home_team"].get("id")
+        if home_team_id and "Mentone" in game["home_team"].get("name", ""):
+            if home_team_id not in team_games:
+                team_games[home_team_id] = []
+            team_games[home_team_id].append(game)
 
-        # Away team
-        away_element = teams_element.select_one(".fixture-details-team-away")
-        if away_element:
-            away_name_element = away_element.select_one(".fixture-details-team-name")
-            if away_name_element:
-                game_details["away_team"] = {
-                    "name": away_name_element.text.strip()
-                }
+        # Process away team
+        away_team_id = game["away_team"].get("id")
+        if away_team_id and "Mentone" in game["away_team"].get("name", ""):
+            if away_team_id not in team_games:
+                team_games[away_team_id] = []
+            team_games[away_team_id].append(game)
 
-            away_score_element = away_element.select_one(".fixture-details-team-score")
-            if away_score_element:
-                score_text = away_score_element.text.strip()
-                if score_text and score_text != "-":
-                    try:
-                        game_details["away_team"]["score"] = int(score_text)
-                    except ValueError:
-                        logger.warning(f"Invalid away score: {score_text}")
+    # Generate team summaries
+    team_summaries = generate_team_summaries(team_games)
 
-    # Determine game status
-    if "home_team" in game_details and "away_team" in game_details:
-        home_score = game_details["home_team"].get("score")
-        away_score = game_details["away_team"].get("score")
+    if team_summaries:
+        # Update in Firestore
+        creates, updates = batch_write_to_firestore(db, team_summaries, "team_summaries")
+        logger.info(f"Updated {len(team_summaries)} team summaries ({creates} created, {updates} updated)")
 
-        if home_score is not None and away_score is not None:
-            game_details["status"] = "completed"
-        elif game_details.get("date") and game_details["date"] < datetime.now():
-            game_details["status"] = "in_progress"
-        else:
-            game_details["status"] = "scheduled"
-
-    return game_details
-
-def fetch_team_games(team):
-    """
-    Fetch games for a specific team.
-
-    Args:
-        team (dict): Team dictionary
-
-    Returns:
-        list: List of game dictionaries
-    """
-    logger.info(f"Fetching games for team: {team['name']} (Fixture ID: {team['fixture_id']})")
-
-    # Get team document from Firestore
-    team_doc = db.collection("teams").document(f"team_{team['fixture_id']}").get()
-    if not team_doc.exists:
-        logger.warning(f"Team {team['name']} not found in Firestore")
-        return []
-
-    team_data = team_doc.to_dict()
-
-    # Get competition document
-    comp_doc = db.collection("competitions").document(f"comp_{team['comp_id']}").get()
-    if not comp_doc.exists:
-        logger.warning(f"Competition {team['comp_id']} not found in Firestore")
-        comp_ref = None
+        # Generate and update club summaries
+        club_summaries = generate_club_summaries(team_summaries)
+        if club_summaries:
+            creates, updates = batch_write_to_firestore(db, club_summaries, "club_summaries")
+            logger.info(f"Updated {len(club_summaries)} club summaries ({creates} created, {updates} updated)")
     else:
-        comp_ref = db.collection("competitions").document(f"comp_{team['comp_id']}")
+        logger.info("No team summaries to update")
 
-    games = []
+def main():
+    """Main function to run the results poller."""
+    start_time = time.time()
+    logger.info(f"=== Mentone Hockey Club Results Poller ===")
 
-    # Fetch data for each round (up to 20 rounds)
-    for round_num in range(1, 21):
-        round_url = f"{BASE_URL}{team['comp_id']}/{team['fixture_id']}/round/{round_num}"
-        response = make_request(round_url)
+    # Check if we're in dry run mode
+    if is_dry_run():
+        logger.info("Running in DRY RUN mode - no Firestore changes will be made")
 
-        if not response:
-            # If we can't get this round, we've probably reached the end
-            if round_num > 1:
-                logger.debug(f"Reached end of rounds at round {round_num}")
-                break
-            else:
-                logger.warning(f"Failed to fetch round 1 for team {team['name']}")
-                continue
+    try:
+        # Poll for recent results
+        poll_recent_results()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
 
-        # Find all games on this page
-        game_elements = soup.select(".fixture-details")
+    elapsed_time = time.time() - start_time
+    logger.info(f"Results polling completed in {elapsed_time:.2f} seconds")
 
-        # Find games involving this team
-        for game_element in game_elements:
-            teams_element = game_element.select_one(".fixture-details-teams")
-            if not teams_element:
-                continue
-
-            team_elements = teams_element.select(".fixture-details-team-name")
-            team_names = [elem.text.strip() for elem in team_elements]
-
-            # Check if this team is playing
-            if any(team['name'] in name for name in team_names):
-                # Extract game details
-                game_details = extract_game_details(game_element)
-
-                if game_details:
-                    # Add team and competition references
-                    game_details["team_ref"] = db.collection("teams").document(f"team_{team['fixture_id']}")
-                    game_details["competition_ref"] = comp_ref
-
-                    # Add team IDs to home and away teams
-                    if "home_team" in game_details and team['name'] in game_details["home_team"]["name"]:
-                        game_details["home_team"]["id"] = f"team_{team['fixture_id']}"
-
-                    if "away_team" in game_details and team['name'] in game_details["away_team"]["name"]:
-                        game_details["away_team"]["id"] = f"team_{team['fixture_id']}"
-
-                    # Add fixture info
-                    game_details["fixture_id"] = team['fixture_id']
-                    game_details["comp_id"] = team['comp_id']
-
-                    # Generate a unique ID for the game
-                    game_id = f"game_{team['fixture_id']}_{round_num}_{hash(str(game_details)) % 1000}"
-                    game_details["id"] = game_id
-
-                    games.append(game_details)
-                    logger.debug(f"Found game for {team['name']} in round {round_num}")
-
-        # Short delay between round requests to be friendly to the server
-        time.sleep(0.5)
-
-    logger.info(f"Found {len(games)} games for team {team['name']}")
+if __name__ == "__main__":
+    main()
