@@ -12,6 +12,27 @@ import {
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 
+
+// Add this function to your existing file
+export const testFirestoreConnection = async () => {
+    try {
+        // Get the first document from any collection to test access
+        const testRef = collection(db, 'teams');
+        const testQuery = query(testRef, limit(1));
+        const snapshot = await getDocs(testQuery);
+
+        if (snapshot.empty) {
+            console.log("Connection successful but no documents found");
+            return false;
+        } else {
+            console.log("Connection successful, documents exist");
+            return true;
+        }
+    } catch (error) {
+        console.error("Firestore connection test failed:", error);
+        throw error; // This will help you see the exact error in the console
+    }
+};
 /**
  * Fetch games for a specific date range
  * @param {Date} startDate - Start date for range
@@ -21,6 +42,8 @@ import { db } from '../../firebase';
  */
 export const fetchGamesByDateRange = async (startDate, endDate, clubId = null) => {
     try {
+        console.log("Fetching games with dates:", startDate, endDate, "club:", clubId);
+
         // Create Firestore timestamp objects for our date range
         const startTimestamp = Timestamp.fromDate(startDate);
         const endTimestamp = Timestamp.fromDate(endDate);
@@ -34,11 +57,8 @@ export const fetchGamesByDateRange = async (startDate, endDate, clubId = null) =
             orderBy('date', 'asc')
         );
 
-        // If a club ID is provided, filter for games involving that club
-        // Note: This would require a separate query if using Firestore
-        // since we can't do OR conditions with different fields
-
         const querySnapshot = await getDocs(gameQuery);
+        console.log("Query complete, got", querySnapshot.size, "results");
 
         const games = [];
         querySnapshot.forEach((doc) => {
@@ -49,23 +69,39 @@ export const fetchGamesByDateRange = async (startDate, endDate, clubId = null) =
                 data.date.toDate() :
                 (data.date ? new Date(data.date) : new Date());
 
-            // If club ID is provided, filter results client-side
-            if (clubId) {
-                const homeClubId = data.home_team?.club_id;
-                const awayClubId = data.away_team?.club_id;
-
-                if (homeClubId !== clubId && awayClubId !== clubId) {
-                    return; // Skip this game
-                }
-            }
-
-            games.push({
+            // Create a complete game object with the date properly converted
+            const gameObj = {
                 id: doc.id,
                 ...data,
                 date: gameDate
-            });
+            };
+
+            // Filter by club if needed
+            if (clubId) {
+                // Extract the simple club name from clubId (removing "club_" prefix if it exists)
+                const simpleClubName = clubId.replace('club_', '');
+
+                // Check team details for the simple club name
+                const homeClubId = data.home_team?.club_id?.toLowerCase() || '';
+                const homeClubName = data.home_team?.club?.toLowerCase() || '';
+
+                const awayClubId = data.away_team?.club_id?.toLowerCase() || '';
+                const awayClubName = data.away_team?.club?.toLowerCase() || '';
+
+                // Check if either home or away team matches the club
+                if (homeClubId === simpleClubName ||
+                    homeClubName === simpleClubName ||
+                    awayClubId === simpleClubName ||
+                    awayClubName === simpleClubName) {
+                    games.push(gameObj);
+                }
+            } else {
+                // No club filter, include all games
+                games.push(gameObj);
+            }
         });
 
+        console.log("Returning", games.length, "filtered games");
         return games;
     } catch (error) {
         console.error('Error fetching games by date range:', error);

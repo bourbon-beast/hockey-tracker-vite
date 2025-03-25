@@ -60,8 +60,8 @@ def extract_club_info(team_name):
         # Handle case where there's no delimiter
         club_name = team_name.split()[0]
 
-    # Generate club_id consistent with fresh_start.py
-    club_id = club_name.lower().replace(" ", "_").replace("-", "_")
+    # Generate club_id with club_ prefix to match frontend expectations
+    club_id = "club_" + club_name.lower().replace(" ", "_").replace("-", "_")
 
     return club_name, club_id
 

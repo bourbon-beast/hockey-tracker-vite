@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import ClubWeeklyGames from './ClubWeeklyGames';
+import { testFirestoreConnection } from '../services/firestoreService';
+
 
 const Dashboard = () => {
     const [club, setClub] = useState({
@@ -14,7 +16,24 @@ const Dashboard = () => {
     // In a production app, you'd fetch the club information from Firestore
     // For this demo, we'll use the hard-coded values above
 
+    // Inside the Dashboard component, add this to useEffect:
+    useEffect(() => {
+        const testConnection = async () => {
+            try {
+                const result = await testFirestoreConnection();
+                console.log("Connection test result:", result);
+            } catch (error) {
+                console.error("Error testing connection:", error);
+            }
+        };
+
+        testConnection();
+    }, []);
+
     return (
+
+
+
         <div className="min-h-screen bg-gray-100">
             {/* Navigation Header */}
             <nav className="bg-blue-800 text-white p-4">
